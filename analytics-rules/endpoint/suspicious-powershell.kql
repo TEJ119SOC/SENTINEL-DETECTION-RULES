@@ -1,0 +1,112 @@
+// ============================================================
+// Rule Name:    Suspicious PowerShell Execution
+// Description:  Detects potentially malicious PowerShell usage
+//               including encoded commands, download cradles,
+//               execution policy bypass, and common attacker
+//               techniques using PowerShell as a living-off-
+//               the-land binary (LOLBin).
+// Severity:     High
+// MITRE Tactic: Execution (TA0002) | Defence Evasion (TA0005)
+// MITRE Tech:   T1059.001 — PowerShell
+//               T1027 — Obfuscated Files or Information
+//               T1562.001 — Disable or Modify Tools
+// Schedule:     Run every 5 minutes | Lookup last 15 minutes
+// ============================================================
+
+// --- STEP 1: Define suspicious PowerShell indicators ---
+let SuspiciousKeywords = dynamic([
+    "EncodedCommand",           // Base64 encoded payload — common in malware
+    "-enc ",                    // Short form of EncodedCommand
+    "IEX",                      // Invoke-Expression — executes strings as commands
+    "Invoke-Expression",        // Same as above, full form
+    "DownloadString",           // Downloads and executes content from web
+    "DownloadFile",             // Downloads file from remote URL
+    "WebClient",                // .NET web request — used in download cradles
+    "Net.WebClient",            // Same as above
+    "Invoke-WebRequest",        // PowerShell web download
+    "Start-BitsTransfer",       // Alternative download method
+    "bypass",                   // Execution policy bypass
+    "ExecutionPolicy Bypass",   // Explicit bypass flag
+    "hidden",                   // Hidden window — conceals execution
+    "WindowStyle Hidden",       // Same as above, full form
+    "FromBase64String",         // Decoding base64 — obfuscation technique
+    "reflection.assembly",      // In-memory .NET assembly loading
+    "System.Reflection",        // Same as above
+    "mimikatz",                 // Credential dumping tool
+    "sekurlsa",                 // Mimikatz module
+    "Invoke-Mimikatz",          // PowerShell wrapper for mimikatz
+    "nishang",                  // Offensive PowerShell framework
+    "powercat",                 // PowerShell netcat equivalent
+    "-nop",                     // NoProfile flag — evades profile-based detections
+    "NoProfile"                 // Same as above, full form
+]);
+
+// --- STEP 2: Query Security Events for PowerShell execution ---
+SecurityEvent
+| where TimeGenerated >= ago(15m)
+| where EventID == 4688                                // Process creation event
+| where NewProcessName has "powershell"
+    or NewProcessName has "pwsh"                       // PowerShell Core
+| extend CommandLineLower = tolower(CommandLine)
+| where CommandLineLower has_any (SuspiciousKeywords)
+
+// --- STEP 3: Score the risk based on keyword matches ---
+| extend
+    EncodedCommand   = iff(CommandLineLower has_any ("encodedcommand", "-enc "), 1, 0),
+    DownloadCradle   = iff(CommandLineLower has_any ("downloadstring", "downloadfile", "webclient", "invoke-webrequest"), 1, 0),
+    PolicyBypass     = iff(CommandLineLower has_any ("bypass", "executionpolicy bypass"), 1, 0),
+    HiddenWindow     = iff(CommandLineLower has_any ("hidden", "windowstyle hidden"), 1, 0),
+    CredDumping      = iff(CommandLineLower has_any ("mimikatz", "sekurlsa", "invoke-mimikatz"), 1, 0),
+    InMemoryExec     = iff(CommandLineLower has_any ("iex", "invoke-expression", "reflection.assembly"), 1, 0),
+    Obfuscation      = iff(CommandLineLower has_any ("frombase64string", "-nop", "noprofile"), 1, 0)
+| extend RiskScore = EncodedCommand + DownloadCradle + PolicyBypass + HiddenWindow + CredDumping + InMemoryExec + Obfuscation
+| extend Severity = case(
+    RiskScore >= 4, "CRITICAL",
+    RiskScore >= 3, "HIGH",
+    RiskScore >= 2, "MEDIUM",
+    "LOW"
+)
+
+// --- STEP 4: Surface results ---
+| project
+    TimeGenerated,
+    Computer,
+    Account,
+    NewProcessName,
+    CommandLine,
+    ParentProcessName,
+    RiskScore,
+    Severity,
+    EncodedCommand,
+    DownloadCradle,
+    PolicyBypass,
+    HiddenWindow,
+    CredDumping,
+    InMemoryExec,
+    Obfuscation
+| order by RiskScore desc
+
+// ============================================================
+// RESPONSE ACTIONS
+// 1. Review full CommandLine — decode base64 if encoded:
+//    [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String("<base64>"))
+// 2. Check ParentProcessName:
+//    - Office app (winword, excel) spawning PowerShell = macro execution
+//    - Browser spawning PowerShell = drive-by download
+//    - Both = immediate P2/P1 escalation
+// 3. Check if outbound network connection followed execution
+// 4. Isolate endpoint if CredDumping or DownloadCradle confirmed
+// 5. Submit CommandLine to Any.run or Hybrid Analysis
+//
+// COMMON FALSE POSITIVES
+// - IT admin running legitimate scripts with -ExecutionPolicy Bypass
+// - Software deployment tools using encoded commands
+// - Monitoring agents using WebClient for telemetry
+// Mitigation: whitelist known admin accounts and trusted script paths
+//
+// TUNING NOTES
+// - Add | where Account !in~ (KnownAdminAccounts) to reduce FPs
+// - Raise alert only on RiskScore >= 2 to reduce noise
+// - Enable PowerShell Script Block Logging (Event ID 4104) for
+//   deeper visibility into obfuscated command content
+// ============================================================

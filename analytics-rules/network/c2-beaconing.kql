@@ -1,0 +1,135 @@
+// ============================================================
+// Rule Name:    C2 Beaconing Detection
+// Description:  Detects Command & Control (C2) beaconing
+//               behaviour where a compromised host makes
+//               repeated outbound connections to the same
+//               external IP or domain at regular intervals —
+//               a hallmark of malware checking in with its
+//               operator for instructions.
+// Severity:     High — Critical
+// MITRE Tactic: Command and Control (TA0011)
+// MITRE Tech:   T1071 — Application Layer Protocol
+//               T1571 — Non-Standard Port
+//               T1008 — Fallback Channels
+// Schedule:     Run every 30 minutes | Lookup last 2 hours
+// ============================================================
+
+// --- STEP 1: Collect outbound network connections ---
+let OutboundConnections =
+    CommonSecurityLog
+    | where TimeGenerated >= ago(2h)
+    | where CommunicationDirection == "Outbound"
+       or DeviceAction !in ("deny", "block", "drop")   // Focus on allowed traffic
+    | where DestinationIPv4Address !startswith "10."
+       and DestinationIPv4Address !startswith "192.168."
+       and DestinationIPv4Address !startswith "172."   // Exclude RFC1918 private IPs
+       and DestinationIPv4Address != "127.0.0.1"       // Exclude loopback
+    | project
+        TimeGenerated,
+        SourceIP          = SourceIP,
+        SourceHostName    = DeviceName,
+        DestinationIP     = DestinationIPv4Address,
+        DestinationPort   = DestinationPort,
+        BytesSent         = SentBytes,
+        BytesReceived     = ReceivedBytes,
+        Protocol          = Protocol,
+        ApplicationProtocol = ApplicationProtocol;
+
+// --- STEP 2: Detect beaconing — regular interval connections ---
+let BeaconingHosts =
+    OutboundConnections
+    | summarize
+        ConnectionCount       = count(),
+        FirstSeen             = min(TimeGenerated),
+        LastSeen              = max(TimeGenerated),
+        TotalBytesSent        = sum(BytesSent),
+        TotalBytesReceived    = sum(BytesReceived),
+        AvgBytesSent          = avg(BytesSent),
+        UniquePorts           = dcount(DestinationPort),
+        PortList              = make_set(DestinationPort)
+      by SourceIP, SourceHostName, DestinationIP
+    | where ConnectionCount >= 10                       // At least 10 connections
+    | extend
+        DurationMinutes = datetime_diff('minute', LastSeen, FirstSeen),
+        AvgIntervalMins = iff(ConnectionCount > 1,
+                            todouble(datetime_diff('minute', LastSeen, FirstSeen)) / todouble(ConnectionCount - 1),
+                            todouble(0))
+    | where DurationMinutes >= 30                       // Spanning at least 30 minutes
+    | where AvgIntervalMins between (1.0 .. 60.0)      // Regular intervals 1-60 mins
+    | where AvgBytesSent < 10000;                       // Small payloads = C2 heartbeat
+
+// --- STEP 3: Flag suspicious ports ---
+let SuspiciousPorts = dynamic([4444, 4445, 8080, 8443, 1337, 31337, 6666, 9001, 9030]);
+
+BeaconingHosts
+| extend
+    SuspiciousPort    = iff(PortList has_any (SuspiciousPorts), "YES", "No"),
+    LowDataVolume     = iff(AvgBytesSent < 1000, "YES", "No"),
+    HighFrequency     = iff(AvgIntervalMins < 5, "YES", "No")
+
+// --- STEP 4: Score and classify ---
+| extend BeaconScore = case(
+    SuspiciousPort == "YES" and LowDataVolume == "YES", 3,
+    SuspiciousPort == "YES" or HighFrequency == "YES",  2,
+    ConnectionCount >= 20,                               2,
+    1
+)
+| extend Severity = case(
+    BeaconScore >= 3, "CRITICAL",
+    BeaconScore == 2, "HIGH",
+    "MEDIUM"
+)
+
+// --- STEP 5: Surface results ---
+| project
+    SourceHostName,
+    SourceIP,
+    DestinationIP,
+    ConnectionCount,
+    AvgIntervalMins   = round(AvgIntervalMins, 1),
+    DurationMinutes,
+    AvgBytesSent      = round(AvgBytesSent, 0),
+    TotalBytesSent,
+    PortList,
+    SuspiciousPort,
+    LowDataVolume,
+    HighFrequency,
+    FirstSeen,
+    LastSeen,
+    BeaconScore,
+    Severity
+| order by BeaconScore desc, ConnectionCount desc
+
+// ============================================================
+// WHAT IS BEACONING?
+// After malware infects a host, it "calls home" to its C2 server
+// at regular intervals (every 5, 10, 30 mins) to receive commands.
+// These connections are:
+//   - Small in size (just a heartbeat or task check)
+//   - Regular in interval (consistent timing = automated)
+//   - Persistent (continue for hours or days)
+//
+// RESPONSE ACTIONS
+// 1. Look up DestinationIP on:
+//    - VirusTotal — any malware associations?
+//    - AbuseIPDB — reported C2 or malicious activity?
+//    - Shodan — what is running on this IP?
+// 2. Check SourceHostName in EDR for malware alerts
+// 3. Review process making the connection — what initiated it?
+// 4. Block DestinationIP at firewall immediately if confirmed
+// 5. Isolate SourceHostName from network
+// 6. Check if other hosts are connecting to same DestinationIP
+//    (indicates wider compromise)
+//
+// COMMON FALSE POSITIVES
+// - Legitimate software update checks (antivirus, browsers)
+// - Monitoring agents sending telemetry at fixed intervals
+// - NTP time synchronisation
+// Mitigation: build allowlist of known software update IPs
+//
+// TUNING NOTES
+// - Adjust ConnectionCount threshold for your traffic volume
+// - Add | where DestinationIP !in~ (KnownSafeIPs) for allowlist
+// - DNS-based C2 won't appear here — use DNS logs separately
+// - Combine with threat intel watchlist for known C2 IPs
+// ============================================================

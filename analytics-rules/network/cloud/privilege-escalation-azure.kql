@@ -1,0 +1,145 @@
+// ============================================================
+// Rule Name:    Azure Privilege Escalation Detection
+// Description:  Detects suspicious privilege escalation activity
+//               in Azure Active Directory and Azure resources —
+//               including role assignments, admin promotions,
+//               guest account elevation, and service principal
+//               abuse. A key indicator of account compromise
+//               or insider threat.
+// Severity:     High — Critical
+// MITRE Tactic: Privilege Escalation (TA0004)
+//               Persistence (TA0003)
+// MITRE Tech:   T1078.004 — Valid Accounts: Cloud Accounts
+//               T1548 — Abuse Elevation Control Mechanism
+//               T1136.003 — Create Cloud Account
+// Schedule:     Run every 15 minutes | Lookup last 1 hour
+// ============================================================
+
+// --- STEP 1: Detect new role assignments in Azure AD ---
+let RoleAssignments =
+    AuditLogs
+    | where TimeGenerated >= ago(1h)
+    | where OperationName in (
+        "Add member to role",
+        "Add eligible member to role",
+        "Add owner to application",
+        "Add app role assignment to service principal"
+    )
+    | where Result == "success"
+    | extend
+        InitiatedBy       = tostring(InitiatedBy.user.userPrincipalName),
+        InitiatedByIP     = tostring(InitiatedBy.user.ipAddress),
+        TargetUser        = tostring(TargetResources[0].userPrincipalName),
+        TargetDisplayName = tostring(TargetResources[0].displayName),
+        RoleAssigned      = tostring(TargetResources[0].modifiedProperties[0].newValue)
+    | project
+        TimeGenerated,
+        OperationName,
+        InitiatedBy,
+        InitiatedByIP,
+        TargetUser,
+        TargetDisplayName,
+        RoleAssigned,
+        Category;
+
+// --- STEP 2: Flag high-privilege role assignments ---
+let HighPrivilegeRoles = dynamic([
+    "Global Administrator",
+    "Privileged Role Administrator",
+    "Security Administrator",
+    "Exchange Administrator",
+    "SharePoint Administrator",
+    "User Account Administrator",
+    "Application Administrator",
+    "Cloud Application Administrator",
+    "Hybrid Identity Administrator",
+    "Privileged Authentication Administrator"
+]);
+
+let HighPrivEscalations =
+    RoleAssignments
+    | where RoleAssigned has_any (HighPrivilegeRoles)
+    | extend EscalationType = "High Privilege Role Assignment"
+    | extend Severity = "CRITICAL";
+
+// --- STEP 3: Detect self-escalation (user assigns role to themselves) ---
+let SelfEscalations =
+    RoleAssignments
+    | where InitiatedBy == TargetUser
+    | extend EscalationType = "Self Role Assignment"
+    | extend Severity = "CRITICAL";
+
+// --- STEP 4: Detect guest account promotions ---
+let GuestEscalations =
+    AuditLogs
+    | where TimeGenerated >= ago(1h)
+    | where OperationName == "Add member to role"
+    | where Result == "success"
+    | extend TargetUser = tostring(TargetResources[0].userPrincipalName)
+    | where TargetUser has "#EXT#"                     // External/guest account indicator
+    | extend
+        InitiatedBy    = tostring(InitiatedBy.user.userPrincipalName),
+        RoleAssigned   = tostring(TargetResources[0].modifiedProperties[0].newValue),
+        EscalationType = "Guest Account Privilege Escalation",
+        Severity       = "HIGH";
+
+// --- STEP 5: Detect new Global Admins created ---
+let NewGlobalAdmins =
+    AuditLogs
+    | where TimeGenerated >= ago(1h)
+    | where OperationName == "Add member to role"
+    | where Result == "success"
+    | extend RoleAssigned = tostring(TargetResources[0].modifiedProperties[0].newValue)
+    | where RoleAssigned has "Global Administrator"
+    | extend
+        InitiatedBy    = tostring(InitiatedBy.user.userPrincipalName),
+        TargetUser     = tostring(TargetResources[0].userPrincipalName),
+        EscalationType = "New Global Administrator Assigned",
+        Severity       = "CRITICAL";
+
+// --- STEP 6: Combine all escalation types ---
+union HighPrivEscalations, SelfEscalations, GuestEscalations, NewGlobalAdmins
+| project
+    TimeGenerated,
+    EscalationType,
+    Severity,
+    InitiatedBy,
+    InitiatedByIP,
+    TargetUser,
+    RoleAssigned,
+    OperationName
+| order by TimeGenerated desc
+
+// ============================================================
+// WHY THIS MATTERS
+// Privilege escalation in Azure AD is one of the most dangerous
+// post-compromise actions an attacker can take. A Global Admin
+// can access ALL data, disable security controls, create
+// backdoor accounts, and persist indefinitely.
+//
+// RESPONSE ACTIONS
+// 1. Immediately verify the role assignment was authorised:
+//    - Was there a change request ticket for this?
+//    - Did the InitiatedBy account make this change intentionally?
+// 2. If unauthorised:
+//    - Remove the assigned role immediately
+//    - Disable the InitiatedBy account
+//    - Revoke all active sessions for both accounts
+//    - Check what actions TargetUser took after escalation
+// 3. Check InitiatedByIP — was it from an expected location?
+// 4. Review if InitiatedBy account had recent suspicious logins
+//    (possible account compromise leading to this escalation)
+// 5. Escalate to Tier 2 / SOC Manager for all CRITICAL findings
+//
+// COMMON FALSE POSITIVES
+// - IT admin legitimately promoting a new team member
+// - Automated provisioning via approved scripts
+// - Break-glass admin account activation (emergency access)
+// Mitigation: create allowlist of approved admin accounts
+//             that regularly perform role assignments
+//
+// TUNING NOTES
+// - Add | where InitiatedBy !in~ (ApprovedAdmins) to reduce FPs
+// - Alert on ANY Global Admin assignment regardless of who initiated
+// - Combine with SigninLogs to check if InitiatedBy had risky login
+// ============================================================

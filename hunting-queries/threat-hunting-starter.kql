@@ -1,0 +1,181 @@
+// ============================================================
+// Title:        Threat Hunting Starter Queries
+// Description:  A collection of proactive threat hunting queries
+//               for Microsoft Sentinel. Unlike analytics rules
+//               which fire automatically, these are run manually
+//               by analysts to proactively search for threats
+//               that may have evaded automated detection.
+// Author:       Sai Teja Adapa — SOC Analyst Level 1
+// Framework:    MITRE ATT&CK
+// ============================================================
+
+// ============================================================
+// HUNT 1 — Accounts Created Outside Business Hours
+// Tactic: Persistence (TA0003) | T1136 — Create Account
+// Why: Attackers create backdoor accounts at night to avoid
+//      detection by IT staff monitoring during business hours.
+// ============================================================
+AuditLogs
+| where TimeGenerated >= ago(7d)
+| where OperationName == "Add user"
+| where Result == "success"
+| extend
+    CreatedBy  = tostring(InitiatedBy.user.userPrincipalName),
+    NewAccount = tostring(TargetResources[0].userPrincipalName),
+    Hour       = datetime_part("hour", TimeGenerated)
+| where Hour < 7 or Hour > 19                          // Outside 07:00 - 19:00
+| project TimeGenerated, CreatedBy, NewAccount, Hour
+| order by TimeGenerated desc
+
+// ============================================================
+// HUNT 2 — Large File Downloads from SharePoint / OneDrive
+// Tactic: Exfiltration (TA0010) | T1048 — Exfiltration Over
+//         Alternative Protocol
+// Why: Attackers bulk-download sensitive files before exiting
+//      the environment. 50+ files in one hour is unusual.
+// ============================================================
+OfficeActivity
+| where TimeGenerated >= ago(7d)
+| where Operation in ("FileDownloaded", "FileSyncDownloadedFull")
+| summarize
+    FileCount     = count(),
+    FileList      = make_set(SourceFileName, 20),
+    TotalSizeMB   = sum(todouble(FileSize)) / 1048576
+  by UserId, ClientIP, bin(TimeGenerated, 1h)
+| where FileCount > 50
+| extend RiskLevel = case(
+    FileCount > 200, "CRITICAL",
+    FileCount > 100, "HIGH",
+    "MEDIUM"
+)
+| project TimeGenerated, UserId, ClientIP, FileCount, TotalSizeMB, RiskLevel, FileList
+| order by FileCount desc
+
+// ============================================================
+// HUNT 3 — Service Accounts Logging in Interactively
+// Tactic: Defence Evasion (TA0005) | T1078 — Valid Accounts
+// Why: Service accounts should never log in interactively.
+//      If one does, it may indicate credential theft or misuse.
+// ============================================================
+SigninLogs
+| where TimeGenerated >= ago(7d)
+| where UserPrincipalName has_any ("svc-", "sa-", "service", "svc.")
+| where ResultType == "0"                              // Successful login
+| where AuthenticationRequirement == "singleFactorAuthentication"
+| project
+    TimeGenerated,
+    UserPrincipalName,
+    IPAddress,
+    Location,
+    AppDisplayName,
+    ClientAppUsed
+| order by TimeGenerated desc
+
+// ============================================================
+// HUNT 4 — DNS Queries to Newly Registered Domains
+// Tactic: Command and Control (TA0011) | T1568 — Dynamic
+//         Resolution
+// Why: Malware and phishing campaigns often use domains
+//      registered within the last 30 days to avoid blocklists.
+// ============================================================
+DnsEvents
+| where TimeGenerated >= ago(24h)
+| where SubType == "LookupQuery"
+| extend DomainAge = datetime_diff('day', now(), todatetime("2024-01-01")) // Replace with threat intel feed
+| join kind=inner (
+    ExternalDnsLogs                                    // Requires DNS connector
+    | where TimeGenerated >= ago(24h)
+    | where DomainCreatedDate >= ago(30d)              // Newly registered
+) on $left.Name == $right.DomainName
+| project TimeGenerated, Computer, Name, QueryType, DomainCreatedDate
+| order by TimeGenerated desc
+
+// ============================================================
+// HUNT 5 — Users with Multiple Concurrent Sessions
+// Tactic: Initial Access (TA0001) | T1078 — Valid Accounts
+// Why: A user logged in from 3+ locations simultaneously
+//      strongly suggests credential sharing or account theft.
+// ============================================================
+SigninLogs
+| where TimeGenerated >= ago(1h)
+| where ResultType == "0"
+| summarize
+    SessionCount   = count(),
+    IPList         = make_set(IPAddress),
+    LocationList   = make_set(Location),
+    UniqueIPs      = dcount(IPAddress),
+    UniqueCountries = dcount(Location)
+  by UserPrincipalName, bin(TimeGenerated, 1h)
+| where UniqueIPs >= 3
+| extend RiskLevel = case(
+    UniqueCountries >= 3, "CRITICAL",
+    UniqueIPs >= 5,       "HIGH",
+    "MEDIUM"
+)
+| project TimeGenerated, UserPrincipalName, SessionCount, UniqueIPs, UniqueCountries, IPList, LocationList, RiskLevel
+| order by UniqueIPs desc
+
+// ============================================================
+// HUNT 6 — Scheduled Tasks Created via Command Line
+// Tactic: Persistence (TA0003) | T1053.005 — Scheduled Task
+// Why: Attackers use scheduled tasks to maintain persistence
+//      and survive reboots. Legitimate tasks are rarely created
+//      via command line during business operations.
+// ============================================================
+SecurityEvent
+| where TimeGenerated >= ago(7d)
+| where EventID == 4688
+| where NewProcessName has_any ("schtasks.exe", "at.exe")
+| where CommandLine has_any ("/create", "/change", "-create")
+| project
+    TimeGenerated,
+    Computer,
+    Account,
+    CommandLine,
+    ParentProcessName
+| order by TimeGenerated desc
+
+// ============================================================
+// HUNT 7 — Dormant Accounts Suddenly Active
+// Tactic: Initial Access (TA0001) | T1078 — Valid Accounts
+// Why: Attackers compromise old/forgotten accounts that have
+//      fewer monitoring controls. A 90-day dormant account
+//      suddenly logging in is a significant red flag.
+// ============================================================
+let ActiveAccounts =
+    SigninLogs
+    | where TimeGenerated >= ago(7d)
+    | where ResultType == "0"
+    | summarize RecentLogins = count() by UserPrincipalName;
+
+let DormantAccounts =
+    SigninLogs
+    | where TimeGenerated between (ago(180d) .. ago(90d))  // Active 90-180 days ago
+    | where ResultType == "0"
+    | summarize LastSeen = max(TimeGenerated) by UserPrincipalName;
+
+ActiveAccounts
+| join kind=inner (DormantAccounts) on UserPrincipalName
+| extend DaysDormant = datetime_diff('day', now(), LastSeen)
+| where DaysDormant >= 90
+| project UserPrincipalName, RecentLogins, LastSeen, DaysDormant
+| order by DaysDormant desc
+
+// ============================================================
+// HOW TO USE THESE HUNTING QUERIES
+//
+// 1. Open Microsoft Sentinel -> Logs
+// 2. Copy and paste any single hunt query above
+// 3. Adjust the time range (ago(7d), ago(24h)) as needed
+// 4. Run and review results
+// 5. For any suspicious findings:
+//    - Cross-reference with other log sources
+//    - Open a ticket and follow the relevant playbook
+//    - Document your findings even if benign (tuning value)
+//
+// HUNTING MINDSET
+// - Assume breach — look for what already got through
+// - Focus on behaviour, not just signatures
+// - One anomaly is noise. Two anomalies is a pattern.
+// - Document every hunt — positive or negative
+// ============================================================

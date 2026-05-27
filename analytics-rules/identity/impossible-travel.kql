@@ -1,0 +1,117 @@
+// ============================================================
+// Rule Name:    Impossible Travel Detection
+// Description:  Detects when a user successfully authenticates
+//               from two different countries within a timeframe
+//               that makes physical travel impossible.
+//               Classic indicator of account compromise or
+//               credential sharing.
+// Severity:     High
+// MITRE Tactic: Initial Access (TA0001)
+// MITRE Tech:   T1078 — Valid Accounts
+// Schedule:     Run every 30 minutes | Lookup last 1 hour
+// ============================================================
+
+// --- STEP 1: Collect successful sign-ins with location ---
+let SuccessfulSignins =
+    SigninLogs
+    | where TimeGenerated >= ago(1h)
+    | where ResultType == "0"                          // Successful logins only
+    | where isnotempty(Location)                       // Must have location data
+    | extend
+        Country    = tostring(LocationDetails.countryOrRegion),
+        City       = tostring(LocationDetails.city),
+        Latitude   = toreal(LocationDetails.geoCoordinates.latitude),
+        Longitude  = toreal(LocationDetails.geoCoordinates.longitude)
+    | where isnotempty(Country)
+    | project
+        TimeGenerated,
+        UserPrincipalName,
+        IPAddress,
+        Country,
+        City,
+        Latitude,
+        Longitude,
+        AppDisplayName,
+        AuthenticationRequirement;
+
+// --- STEP 2: Find users who logged in from 2+ countries ---
+let MultiCountryUsers =
+    SuccessfulSignins
+    | summarize
+        Countries     = make_set(Country),
+        CountryCount  = dcount(Country)
+      by UserPrincipalName
+    | where CountryCount >= 2;
+
+// --- STEP 3: Get the two most recent logins for flagged users ---
+let RecentLogins =
+    SuccessfulSignins
+    | join kind=inner (MultiCountryUsers) on UserPrincipalName
+    | summarize
+        arg_max(TimeGenerated, *),
+        FirstLogin  = min(TimeGenerated),
+        LastLogin   = max(TimeGenerated)
+      by UserPrincipalName, Country
+    | project
+        UserPrincipalName,
+        Country,
+        City,
+        IPAddress,
+        FirstLogin,
+        LastLogin,
+        AppDisplayName;
+
+// --- STEP 4: Self-join to compare login pairs ---
+RecentLogins
+| join kind=inner (RecentLogins) on UserPrincipalName
+| where Country != Country1                            // Different countries
+| where FirstLogin < FirstLogin1                       // Chronological order
+| extend
+    TimeDiffMinutes  = datetime_diff('minute', FirstLogin1, LastLogin),
+    TravelRequired   = strcat(Country, " -> ", Country1)
+| where TimeDiffMinutes < 240                          // Less than 4 hours between logins
+| extend
+    ImpossibilityScore = case(
+        TimeDiffMinutes < 60,  "CRITICAL — under 1 hour",
+        TimeDiffMinutes < 120, "HIGH — under 2 hours",
+        TimeDiffMinutes < 240, "MEDIUM — under 4 hours",
+        "LOW"
+    )
+| project
+    UserPrincipalName,
+    TravelRequired,
+    Login1_Country   = Country,
+    Login1_City      = City,
+    Login1_IP        = IPAddress,
+    Login1_Time      = LastLogin,
+    Login1_App       = AppDisplayName,
+    Login2_Country   = Country1,
+    Login2_City      = City1,
+    Login2_IP        = IPAddress1,
+    Login2_Time      = FirstLogin1,
+    Login2_App       = AppDisplayName1,
+    TimeDiffMinutes,
+    ImpossibilityScore
+| order by TimeDiffMinutes asc
+
+// ============================================================
+// RESPONSE ACTIONS
+// 1. Confirm user did not use a VPN (VPN can cause false positives)
+// 2. Check if user is a frequent traveller — review login history
+// 3. If VPN ruled out and travel impossible -> account compromise
+// 4. Immediately disable account and revoke all sessions
+// 5. Force password reset and re-register MFA
+// 6. Review all activity between Login1_Time and Login2_Time
+//    for any data access, rule creation, or privilege changes
+//
+// COMMON FALSE POSITIVES
+// - User connected via VPN in another country
+// - Cloud proxy or anonymiser service in use
+// - Shared accounts (should not exist — flag for remediation)
+// - Mobile roaming with cached location data
+//
+// TUNING NOTES
+// - Adjust TimeDiffMinutes threshold based on org geography
+// - Add known VPN IP ranges to exclusion list
+// - Focus on admin accounts for tighter threshold (< 60 mins)
+// ============================================================

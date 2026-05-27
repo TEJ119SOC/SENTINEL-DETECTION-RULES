@@ -1,0 +1,89 @@
+// ============================================================
+// Rule Name:    Brute Force Detection — Multiple Failed Sign-ins
+// Description:  Detects when a single IP address generates more
+//               than 10 failed login attempts against one or more
+//               accounts within a 5-minute window.
+// Severity:     Medium
+// MITRE Tactic: Credential Access (TA0006)
+// MITRE Tech:   T1110.001 — Brute Force: Password Guessing
+// Schedule:     Run every 5 minutes | Lookup last 15 minutes
+// ============================================================
+
+// --- STEP 1: Collect failed sign-in events ---
+let FailedLogins =
+    SigninLogs
+    | where TimeGenerated >= ago(15m)
+    | where ResultType != "0"                          // Non-zero = failed login
+    | where ResultType !in ("50126", "50076")          // Exclude MFA challenge (not a failure)
+    | project
+        TimeGenerated,
+        IPAddress,
+        UserPrincipalName,
+        ResultType,
+        ResultDescription,
+        Location,
+        AppDisplayName,
+        UserAgent;
+
+// --- STEP 2: Aggregate by IP and time window ---
+let BruteForceIPs =
+    FailedLogins
+    | summarize
+        FailedAttempts  = count(),
+        TargetAccounts  = dcount(UserPrincipalName),
+        AccountList     = make_set(UserPrincipalName),
+        FirstAttempt    = min(TimeGenerated),
+        LastAttempt     = max(TimeGenerated),
+        AppList         = make_set(AppDisplayName),
+        Location        = any(Location)
+      by IPAddress, bin(TimeGenerated, 5m)
+    | where FailedAttempts > 10;                       // Threshold — tune to your environment
+
+// --- STEP 3: Check if any attempt succeeded from same IP ---
+let SuccessfulLogins =
+    SigninLogs
+    | where TimeGenerated >= ago(15m)
+    | where ResultType == "0"
+    | project
+        IPAddress,
+        SuccessfulUser  = UserPrincipalName,
+        SuccessTime     = TimeGenerated;
+
+// --- STEP 4: Join to flag IPs with both failures and a success ---
+BruteForceIPs
+| join kind=leftouter (SuccessfulLogins) on IPAddress
+| extend
+    SuccessAfterFailure = iff(isnotempty(SuccessfulUser), "YES", "No"),
+    RiskLevel = iff(isnotempty(SuccessfulUser), "HIGH", "MEDIUM")
+| project
+    TimeGenerated,
+    IPAddress,
+    Location,
+    FailedAttempts,
+    TargetAccounts,
+    AccountList,
+    AppList,
+    FirstAttempt,
+    LastAttempt,
+    SuccessAfterFailure,
+    SuccessfulUser,
+    RiskLevel
+| order by FailedAttempts desc
+
+// ============================================================
+// ALERT LOGIC
+// Trigger alert when: FailedAttempts > 10 within 5 minutes
+// Increase severity to HIGH if SuccessAfterFailure == "YES"
+//
+// RESPONSE ACTIONS
+// 1. Look up IPAddress on AbuseIPDB and VirusTotal
+// 2. If SuccessAfterFailure = YES -> follow brute-force playbook
+// 3. If TargetAccounts > 5 -> likely password spray -> see password-spray-detection.kql
+// 4. Block IP at firewall if confirmed malicious
+// 5. Reset credentials for any successfully accessed accounts
+//
+// TUNING NOTES
+// - Raise threshold (>10) if too many false positives in your env
+// - Add | where IPAddress !in~ (KnownSafeIPs) to exclude trusted ranges
+// - Adjust bin() window from 5m to 10m for lower-volume environments
+// ============================================================
